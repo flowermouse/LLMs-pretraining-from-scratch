@@ -374,8 +374,8 @@ def main():
 
     # Load dataset
     # train_tokens_path = "fineweb10B/fineweb_train_*.bin"
-    train_tokens_path = "gpt_gemma/fineweb10B/fineweb_train_*.bin"
-    val_tokens_path = "gpt_gemma/fineweb10B/fineweb_val_*.bin"
+    train_tokens_path = "../data/fineweb10B/fineweb_train_*.bin"
+    val_tokens_path = "../data/fineweb10B/fineweb_val_*.bin"
     train_data_loader = distributed_batch_generator(
         train_tokens_path,
         batch_size=TRAINING_CONFIG["batch_size"],
