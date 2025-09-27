@@ -149,6 +149,7 @@ class GroupedQueryAttention(nn.Module):
             is_causal=True,
         )
 
+        context = context.transpose(1, 2).reshape(b, num_tokens, self.d_out)
         return self.out_proj(context)
     
 

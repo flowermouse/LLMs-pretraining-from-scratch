@@ -56,7 +56,7 @@ TRAINING_CONFIG = {
     "gradient_accumulation_steps": 4,
     "learning_rate": 4e-4,
     "weight_decay": 0.1,
-    "warmup_steps": 2000,
+    "warmup_steps": 500,
     "max_steps": 200000,  # Serious training 200000
     "eval_interval": 200,
     "save_interval": 1000,
