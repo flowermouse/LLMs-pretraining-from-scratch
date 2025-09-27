@@ -140,12 +140,15 @@ class GroupedQueryAttention(nn.Module):
         keys = keys.repeat_interleave(self.group_size, dim=1)
         values = values.repeat_interleave(self.group_size, dim=1)
 
-        # Attention
-        attn_scores = queries @ keys.transpose(2, 3)
-        attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-        attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
+        # SDPA (keep causal masking)
+        context = F.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            dropout_p=0.0,
+            is_causal=True,
+        )
 
-        context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)
         return self.out_proj(context)
     
 
