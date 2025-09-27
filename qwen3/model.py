@@ -5,14 +5,13 @@ import torch.nn.functional as F
 class FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.fc1 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
-        self.fc2 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
+        # 合并两路并行投影：一次 GEMM 输出 2*hidden_dim，后续 chunk
+        self.fc12 = nn.Linear(cfg["emb_dim"], 2 * cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
         self.fc3 = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
 
     def forward(self, x):
-        x_fc1 = self.fc1(x)
-        x_fc2 = self.fc2(x)
-        x = nn.functional.silu(x_fc1) * x_fc2
+        up, gate = self.fc12(x).chunk(2, dim=-1)
+        x = nn.functional.gelu(up, approximate="tanh") * gate
         return self.fc3(x)
 
     
@@ -101,9 +100,13 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim = head_dim
         self.d_out = num_heads * head_dim
 
-        self.W_query = nn.Linear(d_in, self.d_out, bias=False, dtype=dtype)
-        self.W_key = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
-        self.W_value = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
+        # 合并 QKV 的投影
+        self.W_qkv = nn.Linear(
+            d_in,
+            self.d_out + 2 * num_kv_groups * head_dim,
+            bias=False,
+            dtype=dtype
+        )
 
         self.out_proj = nn.Linear(self.d_out, d_in, bias=False, dtype=dtype)
 
@@ -116,10 +119,14 @@ class GroupedQueryAttention(nn.Module):
     def forward(self, x, mask, cos, sin):
         b, num_tokens, _ = x.shape
 
-        # Apply projections
-        queries = self.W_query(x)  # (b, num_tokens, num_heads * head_dim)
-        keys = self.W_key(x)       # (b, num_tokens, num_kv_groups * head_dim)
-        values = self.W_value(x)   # (b, num_tokens, num_kv_groups * head_dim)
+        # 一次性计算 QKV
+        qkv = self.W_qkv(x)
+        q_end = self.d_out
+        k_end = q_end + self.num_kv_groups * self.head_dim
+
+        queries = qkv[:, :, :q_end]
+        keys = qkv[:, :, q_end:k_end]
+        values = qkv[:, :, k_end:]
 
         # Reshape
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
