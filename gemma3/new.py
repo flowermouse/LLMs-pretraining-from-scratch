@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention import flex_attention
+from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import create_block_mask
+
 
 class FeedForward(nn.Module):
     def __init__(self, cfg):
@@ -118,8 +120,12 @@ class GroupedQueryAttention(nn.Module):
         else:
             self.scaling = (head_dim) ** -0.5
 
+        self.last_seq_len = None
 
-    def forward(self, x, mask, cos, sin, attn_type: str, sliding_window: int | None):
+
+    def forward(self, x, dense_mask, cos, sin, attn_type: str,
+                sliding_window: int | None,
+                block_mask=None):
         b, num_tokens, _ = x.shape
 
         # Apply projections
@@ -149,29 +155,11 @@ class GroupedQueryAttention(nn.Module):
         # Scale queries
         queries = queries * self.scaling
 
-        # Flex attention
-        # queries/keys/values: (b, h, T, d)
-        # flex_attention 期望同样的形状
-        if attn_type == "sliding_attention":
-            win = sliding_window
-        else:
-            win = None
-
-        def score_mod(score, batch_idx, head_idx, q_pos, k_pos):
-            # 因果掩码
-            if k_pos > q_pos:
-                return float("-inf")
-            # 滑动窗口掩码
-            if win is not None and (q_pos - k_pos) >= win:
-                return float("-inf")
-            return score
-
+        # Use flex_attention with block_mask
         context = flex_attention(
-            queries,
-            keys,
-            values,
-            score_mod=score_mod,
-        )  # (b, h, T, d)
+            queries, keys, values, block_mask=block_mask
+        )  # (b,h,T,d)
+
         context = context.transpose(1, 2).reshape(b, num_tokens, self.d_out)
         return self.out_proj(context)
     
@@ -206,6 +194,8 @@ class TransformerBlock(nn.Module):
         sin_global,
         cos_local,
         sin_local,
+        block_mask_global=None,
+        block_mask_local=None,
     ):
         # Shortcut connection for attention block
         shortcut = x
@@ -215,18 +205,12 @@ class TransformerBlock(nn.Module):
             attn_mask = mask_local
             cos = cos_local
             sin = sin_local
+            block_mask = block_mask_local
         else:
             attn_mask = mask_global
             cos = cos_global
             sin = sin_global
-        
-        # sliding 窗口大小只用于 sliding_attention
-        sliding_window = None
-        if self.attn_type == "sliding_attention":
-            sliding_window = self.att.cfg["sliding_window"] if hasattr(self.att, "cfg") else None
-            # 如果没有保留 cfg，可从外层 cfg 传：这里直接用 getattr
-            if sliding_window is None:
-                sliding_window = getattr(self, "sliding_window", None)
+            block_mask = block_mask_global
 
         x_attn = self.att(
             x,
@@ -234,7 +218,8 @@ class TransformerBlock(nn.Module):
             cos,
             sin,
             attn_type=self.attn_type,
-            sliding_window=sliding_window,
+            sliding_window=None,
+            block_mask=block_mask,
         )
         x_attn = self.post_attention_layernorm(x_attn)
         x = shortcut + x_attn
@@ -281,6 +266,7 @@ class Gemma3Model(nn.Module):
         self.register_buffer("sin_local", sin_local, persistent=False)
         self.register_buffer("cos_global", cos_global, persistent=False)
         self.register_buffer("sin_global", sin_global, persistent=False)
+        self._cached_block_masks = {}  # key: (type, seq_len)
     
     def _create_masks(self, seq_len, device):
         ones = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
@@ -327,11 +313,30 @@ class Gemma3Model(nn.Module):
         mask_local = mask_global | far_past
         return mask_global, mask_local
 
+    def _get_block_mask(self, seq_len, kind: str):
+        # kind: "global" or "sliding"
+        if (kind, seq_len) in self._cached_block_masks:
+            return self._cached_block_masks[(kind, seq_len)]
+        # 构建 block mask（利用稀疏性）
+        if kind == "global":
+            def causal(b, h, q_idx, kv_idx):
+                return q_idx >= kv_idx
+            bm = create_block_mask(causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len)
+        else:
+            SW = self.cfg["sliding_window"]
+            def sliding_causal(b, h, q_idx, kv_idx):
+                return (q_idx >= kv_idx) & ((q_idx - kv_idx) <= SW)
+            bm = create_block_mask(sliding_causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len)
+        self._cached_block_masks[(kind, seq_len)] = bm
+        return bm
+
     def forward(self, input_ids, targets=None):
         # Forward pass
         b, seq_len = input_ids.shape
         x = self.tok_emb(input_ids) * (self.cfg["emb_dim"] ** 0.5)
         mask_global, mask_local = self._create_masks(seq_len, x.device)
+        block_mask_global = self._get_block_mask(seq_len, "global")
+        block_mask_local = self._get_block_mask(seq_len, "sliding")
 
         for block in self.blocks:
             x = block(
@@ -342,6 +347,8 @@ class Gemma3Model(nn.Module):
                 sin_global=self.sin_global,
                 cos_local=self.cos_local,
                 sin_local=self.sin_local,
+                block_mask_global=block_mask_global,
+                block_mask_local=block_mask_local,
             )
 
         x = self.final_norm(x)
