@@ -373,7 +373,6 @@ def main():
         logger.info(f"Final vocabulary size: {vocab_size}")
 
     # Load dataset
-    # train_tokens_path = "fineweb10B/fineweb_train_*.bin"
     train_tokens_path = "../data/fineweb10B/fineweb_train_*.bin"
     val_tokens_path = "../data/fineweb10B/fineweb_val_*.bin"
     train_data_loader = distributed_batch_generator(
