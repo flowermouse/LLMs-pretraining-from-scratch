@@ -57,7 +57,7 @@ def load_model():
     # tokenizer = tiktoken.get_encoding("gpt2")
     
     # Load model
-    checkpoint = torch.load("checkpoint_step_166000.pt", map_location="cpu")
+    checkpoint = torch.load("checkpoint_step_15000.pt", map_location="cpu")
     
     # Recreate model
     model = Qwen3Model(checkpoint['config'])
