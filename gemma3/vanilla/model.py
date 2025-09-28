@@ -222,6 +222,10 @@ class Gemma3Model(nn.Module):
         # Main model parameters
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
+        # 手动用 Kaiming 方式重新初始化 Embedding 层的权重
+        # 使其标准差从 1 变为 1/sqrt(emb_dim)
+        self.tok_emb.weight.data.normal_(mean=0.0, std=cfg["emb_dim"]**-0.5)
+
         self.blocks = nn.ModuleList([
             TransformerBlock(cfg, attn_type)for attn_type in cfg["layer_types"]
         ])
