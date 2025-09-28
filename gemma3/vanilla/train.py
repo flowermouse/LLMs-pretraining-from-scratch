@@ -1,32 +1,30 @@
 """
 Training Gemma 3 from Scratch on Real English Data
-Using publicly available datasets: FineWeb
+Using publicly available datasets: OpenWebText
 Full production-ready implementation with proper context length and model size
 
 torchrun --nproc_per_node=4 train.py
 """
 
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, IterableDataset
+from torch.optim import AdamW
 import json
 import os
 import logging
+from tokenizers import Tokenizer
 import time
+import numpy as np
 import random
 import gc
-import numpy as np
-from pathlib import Path
-import glob
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
-import torch
-import torch.nn.functional as F
-from torch.optim import AdamW
+from model import Gemma3Model
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import OneCycleLR
 from contextlib import nullcontext
-import itertools
-from transformers import GPT2TokenizerFast
-from model import Gemma3Model
 
 # Set up logging
 logging.basicConfig(
@@ -52,13 +50,13 @@ if isinstance(GEMMA3_CONFIG["dtype"], str):
 
 # Training configuration for production
 TRAINING_CONFIG = {
-    "batch_size": 29,
-    "gradient_accumulation_steps": 2,
-    "learning_rate": 6e-4,
+    "batch_size": 10,  # Per device
+    "gradient_accumulation_steps": 3,
+    "learning_rate": 8e-4,
     "weight_decay": 0.1,
-    "warmup_steps": 500,
+    "warmup_steps": 2000,
     "max_steps": 200000,  # Serious training 200000
-    "eval_interval": 200,
+    "eval_interval": 2500,
     "save_interval": 1000,
     "max_grad_norm": 0.5,
     "dtype": torch.bfloat16,
@@ -73,54 +71,116 @@ def is_main_process():
 # Data Loading
 # ============================================================================
 
-def _load_data_shard(file):
-    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
-    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-    assert header[1] == 1, "unsupported version"
-    num_tokens = int(header[2]) # number of tokens (claimed)
-    with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
-        f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
-    return tokens
+class EnglishDataProcessor:
+    """Handles loading and processing of real English datasets with enhanced robustness"""
+    
+    def __init__(self, tokenizer, max_length=4096):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.datasets = []
+        self.dataset_weights = {}  # For weighted sampling
+        
+    def load_all_datasets(self):
+        """优先使用 NumPy+memmap 数据"""
+        if is_main_process():
+            logger.info("Loading datasets (NumPy memmap preferred)...")
 
-def distributed_batch_generator(filename_pattern, batch_size, train_seq_len, bos_id=50256):
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
+        np_train_prefix = "np_data/train_tokens"
+        np_val_prefix = "np_data/val_tokens"
 
-    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
-    random.shuffle(files)
-    file_iter = iter(files)
+        if is_main_process():
+            logger.info("Using NumPy memmap datasets")
+        self.train_tokens_mm, self.train_offsets = self._open_np(np_train_prefix)
+        self.val_tokens_mm, self.val_offsets = self._open_np(np_val_prefix)
 
-    while True:
-        file = next(file_iter)
-        tokens = _load_data_shard(file)
-        tokens_np = tokens.cpu().numpy()  # torch.uint16 -> numpy
-        num_tokens = len(tokens_np)
-        starts = np.arange(0, num_tokens - train_seq_len - 1, train_seq_len)
-        seqs = np.lib.stride_tricks.sliding_window_view(tokens_np, train_seq_len + 1)[starts]
-        batch_targets_np = seqs[:, 1:].copy()
-        # 用完当前分片所有样本再切换下一个分片
-        for i in range(0, len(seqs), batch_size * world_size):
-            batch = seqs[i:i + batch_size * world_size]
-            batch_targets = batch_targets_np[i:i + batch_size * world_size]
-            if len(batch) < batch_size * world_size:
-                break
-            batch_inputs = torch.from_numpy(batch[:, :-1]).to(torch.int32)
-            batch_targets = torch.from_numpy(batch_targets).to(torch.int64)
-            batch_inputs = batch_inputs[rank::world_size]
-            batch_targets = batch_targets[rank::world_size]
-            yield {
-                "input_ids": batch_inputs,
-                "targets": batch_targets,
-            }
+        # 用占位符维持下游接口，但实际不再构建 HuggingFace Dataset
+        self.datasets = [("train_np", None), ("val_np", None)]
+        self.dataset_weights["train_np"] = 0.9
+        self.dataset_weights["val_np"] = 0.1
+
+        if is_main_process():
+            logger.info(f"Memmap train seq: {len(self.train_offsets)-1}, val seq: {len(self.val_offsets)-1}")
+
+    def _open_np(self, prefix):
+        offsets = np.load(f"{prefix}.offsets.npy", mmap_mode="r")
+        total = int(offsets[-1])
+        tokens_mm = np.memmap(f"{prefix}.tokens.int32", mode="r", dtype=np.int32, shape=(total,))
+        return tokens_mm, offsets
+    
+    def process_datasets(self):
+        """当使用 memmap 时，从 NumPy 切片流式产出 token 序列；否则沿用原来的 Dataset 迭代"""
+        if not self.datasets:
+            self.load_all_datasets()
+
+        def gen_from_np(tokens_mm, offsets):
+            n_seq = len(offsets) - 1
+            # 可随机或顺序遍历，这里顺序遍历；如需随机可使用 np.random.permutation(n_seq)
+            while True:
+                for i in range(n_seq):
+                    s, e = int(offsets[i]), int(offsets[i+1])
+                    if e > s:
+                        yield tokens_mm[s:e].tolist()
+
+        if hasattr(self, "train_tokens_mm") and hasattr(self, "val_tokens_mm"):
+            def text_generator():
+                # 简单按比例交替两集
+                while True:
+                    for tokens in gen_from_np(self.train_tokens_mm, self.train_offsets):
+                        yield tokens
+                    for tokens in gen_from_np(self.val_tokens_mm, self.val_offsets):
+                        yield tokens
+            return text_generator()
+
+class EnglishIterableDataset(IterableDataset):
+    """Iterable dataset for streaming large English data with robustness"""
+    
+    def __init__(self, text_generator, tokenizer, max_length=4096, min_length=10):
+        self.text_generator = text_generator
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.min_length = min_length
+        
+    def __iter__(self):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+        buffer = []
+        buffer_length = 0
+        sep_id = self.tokenizer.token_to_id("<sep>")
+
+        for idx, tokens in enumerate(self.text_generator):
+            # 只保留属于本 rank 的样本
+            if (idx % world_size) != rank:
+                continue
+            try:
+                if len(tokens) < self.min_length:
+                    continue
+                buffer.extend(tokens)
+                if sep_id is not None:
+                    buffer.append(sep_id)
+                    buffer_length += 1
+                buffer_length += len(tokens)
+                while buffer_length >= self.max_length:
+                    chunk = buffer[:self.max_length]
+                    buffer = buffer[self.max_length//2:]
+                    buffer_length = len(buffer)
+                    input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
+                    targets = torch.tensor(chunk[1:], dtype=torch.long)
+                    yield {"input_ids": input_ids, "targets": targets}
+                if buffer_length > 2 * self.max_length:
+                    buffer = buffer[-self.max_length:]
+                    buffer_length = len(buffer)
+                    gc.collect()
+            except Exception as e:
+                if is_main_process():
+                    logger.warning(f"Error processing tokens: {e}")
+                continue
 
 # ============================================================================
 # Enhanced Training Functions
 # ============================================================================
 
-def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler, config, device, start_step=0):
+def train_model(model, data_loader, optimizer, scheduler, config, device, start_step=0):
     """Enhanced training function with all production features"""
 
     # Compile model for faster training (PyTorch 2.0+)
@@ -139,32 +199,27 @@ def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler,
     total_loss = 0.0
     log_interval = 100
     start_time = time.time()
-
+    
     if is_main_process():
         logger.info(f"Starting training from step {start_step}")
-
-    # Training loop
-    data_iter = iter(train_data_loader)
-    epoch = 0
-
-    while step < config["max_steps"]:
-        # 每200步评估一次
-        if step % TRAINING_CONFIG["eval_interval"] == 0 and step > 0 and is_main_process():
-            val_loss = validate_model(model, val_data_loader, device, max_batches=128, seq_len=512)
-            logger.info(f"[Validation] Step {step}: avg loss={val_loss:.4f}")
     
+    # Training loop
+    data_iter = iter(data_loader)
+    epoch = 0
+    
+    while step < config["max_steps"]:
         accum_loss = 0.0
         for micro_step in range(config["gradient_accumulation_steps"]):
             try:
                 batch = next(data_iter)
             except StopIteration:
-                data_iter = iter(train_data_loader)
+                data_iter = iter(data_loader)
                 epoch += 1
                 batch = next(data_iter)
-
-            input_ids = batch["input_ids"].to(device, non_blocking=True)  # [1, seq_len]
-            targets = batch["targets"].to(device, non_blocking=True)      # [1, seq_len]
-
+            
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            targets = batch["targets"].to(device, non_blocking=True)
+            
             # 在梯度累积的非最后一次，关闭DDP梯度同步，减少all-reduce
             sync_ctx = (
                 model.no_sync()
@@ -184,12 +239,12 @@ def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler,
                         _, loss = model(input_ids, targets)
                         loss = loss / config["gradient_accumulation_steps"]
                     loss.backward()
-
+            
             accum_loss += float(loss.detach())
 
         if is_main_process():
             print(f"Step {step}: Accumulated loss: {accum_loss}")
-
+        
         # Optimizer step
         if scaler is not None:
             scaler.unscale_(optimizer)
@@ -199,76 +254,46 @@ def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler,
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config["max_grad_norm"])
             optimizer.step()
-
+        
         scheduler.step()
         optimizer.zero_grad()
         step += 1
         total_loss += accum_loss
-
+        
         # Logging (only main process)
         if step % log_interval == 0 and is_main_process():
             elapsed_time = time.time() - start_time
             avg_loss = total_loss / log_interval
             lr = scheduler.get_last_lr()[0]
-            # 统计量：每步每卡只处理一个超长序列，token 数为 context_length
             tokens_per_sec = (
                 log_interval
-                * TRAINING_CONFIG["batch_size"]
-                * GEMMA3_CONFIG["context_length"]
+                * config["batch_size"]
                 * config["gradient_accumulation_steps"]
+                * GEMMA3_CONFIG["context_length"]
                 * (dist.get_world_size() if dist.is_initialized() else 1)
             ) / elapsed_time
             tokens_per_hour = tokens_per_sec * 3600 / 1e9
-
+            
             logger.info(
                 f"Step {step:6d} | Loss: {avg_loss:.4f} | LR: {lr:.4f} | "
                 f"Tokens/sec: {tokens_per_sec:.0f} | Tokens/hour: {tokens_per_hour:.3f} | Epoch: {epoch}"
             )
             total_loss = 0.0
             start_time = time.time()
-
+        
         # Save checkpoint (only main process)
         if step % config["save_interval"] == 0 and is_main_process():
             save_checkpoint(model, optimizer, scheduler, step, accum_loss, f"checkpoint_step_{step}.pt")
-
+        
         # Memory cleanup
         if step % 1000 == 0:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             gc.collect()
-
+    
     if is_main_process():
         logger.info("Training completed!")
     return model
-
-def validate_model(model, val_data_loader, device, max_batches=1024, seq_len=512):
-    """评估模型在验证集上的平均 loss"""
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-
-    with torch.no_grad():
-        val_iter = iter(val_data_loader)
-        for _ in range(max_batches):
-            try:
-                batch = next(val_iter)
-            except StopIteration:
-                break
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            targets = batch["targets"].to(device, non_blocking=True)
-            # 截断到指定长度
-            input_ids = input_ids[:, :seq_len]
-            targets = targets[:, :seq_len]
-            _, loss = model(input_ids, targets)
-            # 有效 token 数（不计 ignore_index）
-            valid_mask = (targets != -100)
-            num_valid = valid_mask.sum().item()
-            total_loss += loss.item() * num_valid
-            total_tokens += num_valid
-
-    avg_loss = total_loss / max(1, total_tokens)
-    model.train()
-    return avg_loss
 
 def save_checkpoint(model, optimizer, scheduler, step, loss, filename):
     """Enhanced checkpoint saving (only called by main process)"""
@@ -364,28 +389,56 @@ def main():
             print("Uses tensor cores")
 
     # Load tokenizer
-    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer_path = "tokenizer.json"
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    if is_main_process():
+        logger.info("Loaded pretrained tokenizer")
+    vocab_size = tokenizer.get_vocab_size()
+    if is_main_process():
+        logger.info(f"Pretrained tokenizer vocab size: {vocab_size}")
     
     # Update config with actual vocab size
-    # vocab_size = tokenizer.vocab_size
-    # GEMMA3_CONFIG["vocab_size"] = vocab_size
-    # if is_main_process():
-    #     logger.info(f"Final vocabulary size: {vocab_size}")
+    actual_vocab_size = tokenizer.get_vocab_size()
+    GEMMA3_CONFIG["vocab_size"] = actual_vocab_size
+    if is_main_process():
+        logger.info(f"Final vocabulary size: {actual_vocab_size}")
+    
+    # Create data processor
+    if is_main_process():
+        logger.info("Setting up data processor...")
+    data_processor = EnglishDataProcessor(tokenizer, max_length=GEMMA3_CONFIG["context_length"])
+    
+    # Load datasets
+    if is_main_process():
+        logger.info("Loading all English datasets...")
+    data_processor.load_all_datasets()
+    
+    if not data_processor.datasets:
+        if is_main_process():
+            logger.error("No datasets loaded! Cannot proceed with training.")
+        return
+    
+    # Create streaming dataset
+    if is_main_process():
+        logger.info("Creating streaming dataset...")
+    text_generator = data_processor.process_datasets()
+    dataset = EnglishIterableDataset(
+        text_generator, 
+        tokenizer, 
+        max_length=GEMMA3_CONFIG["context_length"]
+    )
 
-    # Load dataset
-    train_tokens_path = "../data/fineweb10B/fineweb_train_*.bin"
-    val_tokens_path = "../data/fineweb10B/fineweb_val_*.bin"
-    train_data_loader = distributed_batch_generator(
-        train_tokens_path,
+    data_loader = DataLoader(
+        dataset,
         batch_size=TRAINING_CONFIG["batch_size"],
-        train_seq_len=GEMMA3_CONFIG["context_length"]
+        sampler=None,
+        num_workers=8,
+        pin_memory=True if device.type == "cuda" else False,
+        persistent_workers=True,
+        prefetch_factor=4,
+        pin_memory_device="cuda" if device.type == "cuda" else None,
     )
-    val_data_loader = distributed_batch_generator(
-        val_tokens_path,
-        batch_size=1,
-        train_seq_len=512,  # shorter seq len for validation
-    )
-
+    
     # Initialize model
     if is_main_process():
         logger.info("Initializing Gemma 3 model...")
@@ -439,8 +492,8 @@ def main():
         final_div_factor=1,
     )
 
-    # Load optimizer and scheduler state if resuming
     start_step = 0
+    # Load optimizer and scheduler state if resuming
     if checkpoint:
         if is_main_process():
             logger.info("Loading optimizer and scheduler state from checkpoint...")
@@ -480,8 +533,7 @@ def main():
         logger.info("Starting training...")
     trained_model = train_model(
         model, 
-        train_data_loader,
-        val_data_loader,
+        data_loader, 
         optimizer,
         scheduler,
         TRAINING_CONFIG,
@@ -500,7 +552,7 @@ def main():
             'model_state_dict': model_state_dict,
             'config': GEMMA3_CONFIG,
             'training_config': TRAINING_CONFIG,
-            'vocab_size': vocab_size,
+            'vocab_size': actual_vocab_size,
             'total_params': total_params
         }
         torch.save(final_checkpoint, "final_english_gemma3.pt")
@@ -542,10 +594,15 @@ def main():
     if is_main_process():
         logger.info("Training pipeline completed successfully!")
         logger.info(f"Model saved as: final_english_gemma3.pt")
+        logger.info(f"Tokenizer saved as: {tokenizer_path}")
         logger.info(f"Total parameters: {total_params:,}")
     
     return trained_model
 
-if __name__ == "__main__":    
+if __name__ == "__main__":
+    # Enable optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
+    
     # Run training
     main()

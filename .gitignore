@@ -3,3 +3,4 @@ __pycache__
 *.pt
 *.log
 data/fineweb10B
+np_data
