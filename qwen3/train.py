@@ -52,9 +52,9 @@ if isinstance(QWEN3_CONFIG["dtype"], str):
 
 # Training configuration for production
 TRAINING_CONFIG = {
-    "batch_size": 12,
+    "batch_size": 19,
     "gradient_accumulation_steps": 4,
-    "learning_rate": 4e-4,
+    "learning_rate": 8e-4,
     "weight_decay": 0.1,
     "warmup_steps": 500,
     "max_steps": 200000,  # Serious training 200000
