@@ -241,7 +241,7 @@ def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler,
         logger.info("Training completed!")
     return model
 
-def validate_model(model, val_data_loader, device, max_batches=5120, seq_len=512):
+def validate_model(model, val_data_loader, device, max_batches=1024, seq_len=512):
     """评估模型在验证集上的平均 loss"""
     model.eval()
     total_loss = 0.0
