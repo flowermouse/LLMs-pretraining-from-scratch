@@ -26,7 +26,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from contextlib import nullcontext
 import itertools
 from transformers import GPT2TokenizerFast
-from model import Gemma3Model
+from new import Gemma3Model
 
 # Set up logging
 logging.basicConfig(
