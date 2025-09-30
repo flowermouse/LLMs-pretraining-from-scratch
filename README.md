@@ -45,3 +45,11 @@ This repository references the following repositories:
 ### Note
 - Need no fancy propressing on the training batch, just concatenate all text files into a single file, then read.
 - Gemma3 official model parameter size is 270M, but by definition it is about 430M, the difference is Gemma3 uses shared weights for the embedding layer and the output layer. So the vanilla version should also use shared weights.
+
+|     Model Name      | Parameter Size | Training Tokens per hour |
+| :-----------------: | :------------: | :----------------------: |
+|    modded Qwen 3    |      543M      |       0.207 B / h        |
+|   modded Gemma 3    |      480M      |       0.298 B / h        |
+|  Gemma 3 (vanilla)  |      270M      |       0.245 B / h        |
+| modded Gemma 3 (v2) |      164M      |       0.283 B / h        |
+| modded Gemma3 (v1)  |      480M      |       0.245 B / h        |
