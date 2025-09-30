@@ -52,7 +52,7 @@ if isinstance(QWEN3_CONFIG["dtype"], str):
 
 # Training configuration for production
 TRAINING_CONFIG = {
-    "batch_size": 19,
+    "batch_size": 18,
     "gradient_accumulation_steps": 4,
     "learning_rate": 8e-4,
     "weight_decay": 0.1,
@@ -241,7 +241,7 @@ def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler,
         logger.info("Training completed!")
     return model
 
-def validate_model(model, val_data_loader, device, max_batches=5120, seq_len=512):
+def validate_model(model, val_data_loader, device, max_batches=1024, seq_len=512):
     """评估模型在验证集上的平均 loss"""
     model.eval()
     total_loss = 0.0
