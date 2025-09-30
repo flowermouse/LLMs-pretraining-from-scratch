@@ -52,7 +52,7 @@ if isinstance(QWEN3_CONFIG["dtype"], str):
 
 # Training configuration for production
 TRAINING_CONFIG = {
-    "batch_size": 8,
+    "batch_size": 10,
     "gradient_accumulation_steps": 4,
     "learning_rate": 8e-4,
     "weight_decay": 0.1,
@@ -150,8 +150,9 @@ def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler,
     while step < config["max_steps"]:
         # 每200步评估一次
         if step % TRAINING_CONFIG["eval_interval"] == 0 and step > 0 and is_main_process():
-            val_loss = validate_model(model, val_data_loader, device, max_batches=128, seq_len=512)
+            val_loss = validate_model(model, val_data_loader, device, max_batches=128, seq_len=1024)
             logger.info(f"[Validation] Step {step}: avg loss={val_loss:.4f}")
+            start_time = time.time()  # reset timer after validation
     
         accum_loss = 0.0
         for micro_step in range(config["gradient_accumulation_steps"]):
@@ -241,7 +242,7 @@ def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler,
         logger.info("Training completed!")
     return model
 
-def validate_model(model, val_data_loader, device, max_batches=1024, seq_len=512):
+def validate_model(model, val_data_loader, device, max_batches=256, seq_len=1024):
     """评估模型在验证集上的平均 loss"""
     model.eval()
     total_loss = 0.0
