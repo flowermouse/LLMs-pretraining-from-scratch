@@ -454,7 +454,7 @@ def main():
             model, 
             device_ids=[device.index],
             find_unused_parameters=False,
-            # static_graph=True,
+            static_graph=True,
             bucket_cap_mb=50,
             gradient_as_bucket_view=True,
         )
