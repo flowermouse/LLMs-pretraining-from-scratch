@@ -52,7 +52,7 @@ if isinstance(GEMMA3_CONFIG["dtype"], str):
 
 # Training configuration for production
 TRAINING_CONFIG = {
-    "batch_size": 29,
+    "batch_size": 28,
     "gradient_accumulation_steps": 2,
     "learning_rate": 6e-4,
     "weight_decay": 0.1,
