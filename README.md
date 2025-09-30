@@ -8,9 +8,9 @@ This directory contains code for pretraining language models, including Gemma3 a
 
 # Acknowledgements
 This repository references the following repositories:
-- LLMs from scratch
-- Gemma3 from scratch
-- Modded nanoGPT
+- [LLMs from scratch](https://github.com/rasbt/LLMs-from-scratch)
+- [Gemma3 from scratch](https://github.com/vaisax/pretrain-gemma3-270m-scandic) 
+- [Modded nanoGPT](https://github.com/KellerJordan/modded-nanogpt)
 
 # Features
 ## Speed up training
