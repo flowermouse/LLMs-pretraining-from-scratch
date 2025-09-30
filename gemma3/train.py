@@ -26,7 +26,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from contextlib import nullcontext
 import itertools
 from transformers import GPT2TokenizerFast
-from new import Gemma3Model
+from model import Gemma3Model
 
 # Set up logging
 logging.basicConfig(
@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-with open("config/config.json", "r") as f:
+with open("config.json", "r") as f:
     GEMMA3_CONFIG = json.load(f)
 
 if isinstance(GEMMA3_CONFIG["dtype"], str):
@@ -124,10 +124,10 @@ def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler,
     """Enhanced training function with all production features"""
 
     # Compile model for faster training (PyTorch 2.0+)
-    # if config.get("compile_model", False) and hasattr(torch, 'compile'):
-    #     if is_main_process():
-    #         logger.info("Compiling model for faster training...")
-    #     model = torch.compile(model)
+    if config.get("compile_model", False) and hasattr(torch, 'compile'):
+        if is_main_process():
+            logger.info("Compiling model for faster training...")
+        model = torch.compile(model)
     
     # Mixed precision training
     scaler = torch.amp.GradScaler(enabled=(GEMMA3_CONFIG["dtype"] == torch.float16))

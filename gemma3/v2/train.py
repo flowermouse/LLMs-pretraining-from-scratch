@@ -52,7 +52,7 @@ if isinstance(GEMMA3_CONFIG["dtype"], str):
 
 # Training configuration for production
 TRAINING_CONFIG = {
-    "batch_size": 20,
+    "batch_size": 21,
     "gradient_accumulation_steps": 2,
     "learning_rate": 6e-4,
     "weight_decay": 0.1,
@@ -123,11 +123,11 @@ def distributed_batch_generator(filename_pattern, batch_size, train_seq_len, bos
 def train_model(model, train_data_loader, val_data_loader, optimizer, scheduler, config, device, start_step=0):
     """Enhanced training function with all production features"""
 
-    # Compile model for faster training (PyTorch 2.0+)
-    if config.get("compile_model", False) and hasattr(torch, 'compile'):
-        if is_main_process():
-            logger.info("Compiling model for faster training...")
-        model = torch.compile(model)
+    # # Compile model for faster training (PyTorch 2.0+)
+    # if config.get("compile_model", False) and hasattr(torch, 'compile'):
+    #     if is_main_process():
+    #         logger.info("Compiling model for faster training...")
+    #     model = torch.compile(model)
     
     # Mixed precision training
     scaler = torch.amp.GradScaler(enabled=(GEMMA3_CONFIG["dtype"] == torch.float16))
