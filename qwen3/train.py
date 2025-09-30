@@ -52,7 +52,7 @@ if isinstance(QWEN3_CONFIG["dtype"], str):
 
 # Training configuration for production
 TRAINING_CONFIG = {
-    "batch_size": 18,
+    "batch_size": 8,
     "gradient_accumulation_steps": 4,
     "learning_rate": 8e-4,
     "weight_decay": 0.1,
@@ -364,7 +364,7 @@ def main():
             print("Uses tensor cores")
 
     # Load tokenizer
-    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer = GPT2TokenizerFast.from_pretrained("./gpt2_tokenizer")
     
     # Update config with actual vocab size
     vocab_size = tokenizer.vocab_size
